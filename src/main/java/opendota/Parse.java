@@ -38,11 +38,14 @@ import java.io.OutputStream;
 import opendota.combatlogvisitors.TrackVisitor;
 import opendota.combatlogvisitors.GreevilsGreedVisitor;
 import opendota.combatlogvisitors.TrackVisitor.TrackStatus;
+import opendota.processors.warding.OnWardExpired;
+import opendota.processors.warding.OnWardKilled;
+import opendota.processors.warding.OnWardPlaced;
 
 public class Parse {
 
 	public class Entry {
-		public Integer time;
+		public Integer time = 0;
 		public String type;
 		public Integer team;
 		public String unit;
@@ -104,11 +107,11 @@ public class Parse {
 		public Integer towers_killed;
 		public Integer roshans_killed;
 		public Integer observers_placed;
-        	public Integer draft_order;
-        	public Boolean pick;
-        	public Integer draft_active_team;
-        	public Integer draft_extime0;
-        	public Integer draft_extime1;
+        public Integer draft_order;
+        public Boolean pick;
+        public Integer draft_active_team;
+        public Integer draft_extime0;
+        public Integer draft_extime1;
 
 		public Entry() {
 		}
@@ -150,16 +153,15 @@ public class Parse {
     HashMap<Integer, Integer> ward_ehandle_to_slot = new HashMap<Integer, Integer>();
     InputStream is = null;
     OutputStream os = null;
-	private GreevilsGreedVisitor greevilsGreedVisitor;
-	private TrackVisitor trackVisitor;
+    private GreevilsGreedVisitor greevilsGreedVisitor;
+    private TrackVisitor trackVisitor;
     private ArrayList<Boolean> isPlayerStartingItemsWritten;
+    int pingCount = 0;
+    private ArrayList<Entry> logBuffer = new ArrayList<Entry>();
 
     //Draft stage variable
-
     boolean[] draftOrderProcessed = new boolean[22];
     int order = 1;
-
-
 
     public Parse(InputStream input, OutputStream output) throws IOException
     {
@@ -176,15 +178,26 @@ public class Parse {
       System.err.format("total time taken: %s\n", (tMatch) / 1000.0);
     }
     
-
     public void output(Entry e) {
         try {
-            this.os.write((g.toJson(e) + "\n").getBytes()); 
+            if (gameStartTime == 0) {
+                logBuffer.add(e);
+            } else {
+                e.time -= gameStartTime;
+                this.os.write((g.toJson(e) + "\n").getBytes());
+            }
         }
         catch (IOException ex)
         {
             System.err.println(ex);
         }
+    }
+
+    public void flushLogBuffer() {
+        for (Entry e : logBuffer) {
+            output(e);
+        }
+        logBuffer = null;
     }
     
     //@OnMessage(GeneratedMessage.class)
@@ -232,9 +245,13 @@ public class Parse {
         output(entry);
     }
 
-
     @OnMessage(CDOTAUserMsg_LocationPing.class)
     public void onPlayerPing(Context ctx, CDOTAUserMsg_LocationPing message) {
+        pingCount += 1;
+        if (pingCount > 10000) {
+            return;
+        }
+
         Entry entry = new Entry(time);
         entry.type = "pings";
         entry.slot = message.getPlayerId();
@@ -366,12 +383,17 @@ public class Parse {
             if (combatLogEntry.type.equals("DOTA_COMBATLOG_GAME_STATE") && combatLogEntry.value == 6) {
                 postGame = true;
             }
-
-            output(combatLogEntry);
-            
-            if (cle.getType().ordinal() > 19) {
-                System.err.println(cle);
+            if (combatLogEntry.type.equals("DOTA_COMBATLOG_GAME_STATE") && combatLogEntry.value == 5) {
+                //alternate to combat log for getting game zero time (looks like this is set at the same time as the game start, so it's not any better for streaming)
+                // int currGameStartTime = Math.round( (float) grp.getProperty("m_pGameRules.m_flGameStartTime"));
+                if (gameStartTime == 0) {
+                    gameStartTime = combatLogEntry.time;
+                    flushLogBuffer();
+                }
             }
+            if (cle.getType().ordinal() <= 19) {	
+                output(combatLogEntry);
+	    }
         }
         catch(Exception e)
         {
@@ -382,7 +404,6 @@ public class Parse {
 
     @OnEntityEntered
     public void onEntityEntered(Context ctx, Entity e) {
-        processEntity(ctx, e, false);
         if (e.getDtClass().getDtName().equals("CDOTAWearableItem")) {
         	Integer accountId = getEntityProperty(e, "m_iAccountID", null);
         	Integer itemDefinitionIndex = getEntityProperty(e, "m_iItemDefinitionIndex", null);
@@ -398,11 +419,6 @@ public class Parse {
         		cosmeticsMap.put(itemDefinitionIndex, playerSlot);
         	}
         }
-    }
-    
-    @OnEntityLeft
-    public void onEntityLeft(Context ctx, Entity e) {
-        processEntity(ctx, e, true);
     }
 
     @UsesStringTable("EntityNames")
@@ -492,15 +508,6 @@ public class Parse {
             {
                 nextInterval = time;
             }
-            //alternate to combat log for getting game zero time (looks like this is set at the same time as the game start, so it's not any better for streaming)
-            /*
-            int currGameStartTime = Math.round( (float) grp.getProperty("m_pGameRules.m_flGameStartTime"));
-            if (currGameStartTime != gameStartTime){
-                gameStartTime = currGameStartTime;
-                System.err.println(gameStartTime);
-                System.err.println(time);
-            }
-            */
         }
         if (pr != null) 
         {
@@ -623,8 +630,8 @@ public class Parse {
                             name_to_slot.put(combatLogName, entry.slot);
                             name_to_slot.put(combatLogName2, entry.slot);
 
-                            entry.hero_inventory = getHeroInventory(ctx, e);
-                            if (!isPlayerStartingItemsWritten.get(entry.slot)) {
+                            // entry.hero_inventory = getHeroInventory(ctx, e);
+                            if (!isPlayerStartingItemsWritten.get(entry.slot) && entry.hero_inventory != null) {
                                 // Making something similar to DOTA_COMBATLOG_PURCHASE for each item in the beginning of the game
                                 isPlayerStartingItemsWritten.set(entry.slot, true);
                                 for (Item item : entry.hero_inventory) {
@@ -650,13 +657,9 @@ public class Parse {
         List<Item> inventoryList = new ArrayList<>(6);
 
         for (int i = 0; i < 6; i++) {
-            try {
-                Item item = getHeroItem(ctx, eHero, i);
-                if(item != null) {
-                    inventoryList.add(item);
-                }
-            } catch (UnknownItemFoundException e) {
-                return null;
+            Item item = getHeroItem(ctx, eHero, i);
+            if(item != null) {
+                inventoryList.add(item);
             }
         }
 
@@ -717,45 +720,43 @@ public class Parse {
     	}
     }
     
-    public void processEntity(Context ctx, Entity e, boolean entityLeft)
-    {
-        //CDOTA_NPC_Observer_Ward
-        //CDOTA_NPC_Observer_Ward_TrueSight
-        //s1 "DT_DOTA_NPC_Observer_Ward"
-        //s1 "DT_DOTA_NPC_Observer_Ward_TrueSight"
-        boolean isObserver = e.getDtClass().getDtName().equals("CDOTA_NPC_Observer_Ward");
-        boolean isSentry = e.getDtClass().getDtName().equals("CDOTA_NPC_Observer_Ward_TrueSight");
-        if (isObserver || isSentry) {
-            //System.err.println(e);
-            Entry entry = new Entry(time);
-            Integer x = getEntityProperty(e, "CBodyComponent.m_cellX", null);
-            Integer y = getEntityProperty(e, "CBodyComponent.m_cellY", null);
-            Integer z = getEntityProperty(e, "CBodyComponent.m_cellZ", null);
-            Integer[] pos = {x, y};
-            entry.x = x;
-            entry.y = y;
-            entry.z = z;
-            if (entityLeft)
-            {
-                entry.type = isObserver ? "obs_left" : "sen_left";
-            }
-            else
-            {
-                entry.type = isObserver ? "obs" : "sen";
-            }
-            entry.key = Arrays.toString(pos);
-            entry.entityleft = entityLeft;
-            entry.ehandle = e.getHandle();
-            //System.err.println(entry.key);
-            Integer owner = getEntityProperty(e, "m_hOwnerEntity", null);
-            Entity ownerEntity = ctx.getProcessor(Entities.class).getByHandle(owner);
-            entry.slot = ownerEntity != null ? (Integer) getEntityProperty(ownerEntity, "m_iPlayerID", null) : ward_ehandle_to_slot.get(entry.ehandle);
-            if (entry.slot != null && !ward_ehandle_to_slot.containsKey(entry.ehandle)) {
-                ward_ehandle_to_slot.put(entry.ehandle, entry.slot);
-            }
-            //2/3 radiant/dire
-            //entry.team = e.getProperty("m_iTeamNum");
-            output(entry);
+    @OnWardKilled 
+    public void onWardKilled(Context ctx, Entity e, String killerHeroName) { 
+        Entry wardEntry = buildWardEntry(ctx, e); 
+        wardEntry.attackername = killerHeroName; 
+        output(wardEntry); 
+    } 
+     
+    @OnWardExpired 
+    @OnWardPlaced 
+    public void onWardExistenceChanged(Context ctx, Entity e) { 
+        output(buildWardEntry(ctx, e)); 
+    } 
+ 
+    private Entry buildWardEntry(Context ctx, Entity e) { 
+        Entry entry = new Entry(time); 
+            boolean isObserver = !e.getDtClass().getDtName().contains("TrueSight"); 
+        Integer x = getEntityProperty(e, "CBodyComponent.m_cellX", null); 
+        Integer y = getEntityProperty(e, "CBodyComponent.m_cellY", null); 
+        Integer z = getEntityProperty(e, "CBodyComponent.m_cellZ", null); 
+        Integer life_state = getEntityProperty(e, "m_lifeState", null); 
+        Integer[] pos = {x, y}; 
+        entry.x = x; 
+        entry.y = y; 
+        entry.z = z; 
+        entry.type = isObserver ? "obs" : "sen"; 
+        entry.entityleft = life_state == 1; 
+        entry.key = Arrays.toString(pos); 
+        entry.ehandle = e.getHandle(); 
+     
+        if (entry.entityleft) { 
+            entry.type += "_left"; 
         }
+        
+        Integer owner = getEntityProperty(e, "m_hOwnerEntity", null); 
+        Entity ownerEntity = ctx.getProcessor(Entities.class).getByHandle(owner); 
+        entry.slot = ownerEntity != null ? (Integer) getEntityProperty(ownerEntity, "m_iPlayerID", null) : null; 
+        
+        return entry; 
     }
 }
